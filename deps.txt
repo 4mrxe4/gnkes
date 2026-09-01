@@ -1,0 +1,15 @@
+aiogram
+redis>=5.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+httpx>=0.27.0
+aiohttp>=3.9.0
+pytz>=2024.1
+Pillow>=10.0.0
+pydub>=0.25.1
+gTTS>=2.5.1
+SpeechRecognition
+yt-dlp
+emoji
+pyrogram 
+hijri_converter
