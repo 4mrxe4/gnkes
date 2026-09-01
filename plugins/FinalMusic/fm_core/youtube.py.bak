@@ -1,0 +1,526 @@
+# Plugins1/FinalMusic/fm_core/youtube.py
+
+from helpers.context import get_config, redis_proxy as r, dev_final_proxy as Dev_FINAL, k_proxy as k, get_current_bot_id
+import os
+import re
+import json
+import time
+import glob
+import asyncio
+import random
+import requests
+import subprocess
+from dataclasses import replace
+from pathlib import Path
+from typing import Optional, Union
+from compat import enums, types
+
+from helpers.context import config_proxy as config
+
+import logging
+from ..fm_helpers import Track, utils
+
+logger = logging.getLogger("FinalMusic")
+
+class YouTube:
+    def __init__(self):
+        self.base = "https://www.youtube.com/watch?v="
+        self.cookies = []
+        self.checked = False
+        self.warned = False
+        self.regex = re.compile(
+            r"(https?://)?(www\.|m\.|music\.)?"
+            r"(youtube\.com/(watch\?v=|shorts/|live/|embed/|playlist\?list=)|youtu\.be/)"
+            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
+        )
+        self.search_cache = {}
+        self.cache_time = {}
+        self._download_semaphore = asyncio.Semaphore(10)
+        self._max_video_height = getattr(config, "VIDEO_MAX_HEIGHT", 1080)
+        self.ytdlp_path = "yt-dlp"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8"
+        }
+    
+    def _locate_download_file(self, video_id: str, video: bool = False) -> Optional[str]:
+        pattern = f"downloads/{video_id}*"
+        candidates = sorted([
+            path for path in glob.glob(pattern)
+            if not path.endswith((".part", ".ytdl", ".info.json", ".temp"))
+        ])
+        video_exts = {".mp4", ".mkv", ".webm", ".mov"}
+        audio_exts = {".m4a", ".webm", ".opus", ".mp3", ".ogg", ".wav", ".flac"}
+        if video:
+            for path in candidates:
+                if os.path.isdir(path):
+                    continue
+                if Path(path).suffix.lower() in video_exts:
+                    return path
+        else:
+            for path in candidates:
+                if os.path.isdir(path):
+                    continue
+                if Path(path).suffix.lower() in audio_exts:
+                    return path
+        for path in candidates:
+            if os.path.isdir(path):
+                continue
+            return path
+        return None
+    
+    def get_cookies(self):
+        if not self.checked:
+            cookies_dir = "plugins/FinalMusic/cookies"
+            if os.path.exists(cookies_dir):
+                for file in os.listdir(cookies_dir):
+                    if file.endswith(".txt") and os.path.getsize(os.path.join(cookies_dir, file)) > 0:
+                        self.cookies.append(file)
+            self.checked = True
+            if self.cookies:
+                logger.info(f"✅ Found {len(self.cookies)} local cookie file(s)")
+            else:
+                logger.warning("⚠️ No valid cookie files found in plugins/FinalMusic/cookies/")
+        if not self.cookies:
+            if not self.warned:
+                self.warned = True
+                logger.warning("⚠️ Cookies are missing; downloads will fail.")
+            return None
+        selected = random.choice(self.cookies)
+        cookie_path = f"plugins/FinalMusic/cookies/{selected}"
+        if not os.path.exists(cookie_path) or os.path.getsize(cookie_path) == 0:
+            self.cookies.remove(selected)
+            return self.get_cookies()
+        logger.info(f"🍪 Using cookies file: {selected}")
+        return cookie_path
+    
+    async def save_cookies(self, urls: list[str]) -> None:
+        logger.info("📁 Checking local cookies directory...")
+        cookies_dir = "plugins/FinalMusic/cookies"
+        if not os.path.exists(cookies_dir):
+            os.makedirs(cookies_dir, exist_ok=True)
+            logger.info(f"📁 Created cookies directory: {cookies_dir}")
+        local_cookies = []
+        for file in os.listdir(cookies_dir):
+            if file.endswith(".txt"):
+                file_path = os.path.join(cookies_dir, file)
+                if os.path.getsize(file_path) > 0:
+                    local_cookies.append(file)
+        if local_cookies:
+            self.checked = True
+            self.cookies = local_cookies
+            logger.info(f"✅ Found {len(local_cookies)} local cookie file(s)")
+            return
+        logger.warning("⚠️ No local cookie files found in plugins/FinalMusic/cookies/")
+        logger.warning("⚠️ Please add valid cookies.txt files to this directory")
+        self.checked = True
+    
+    def valid(self, url: str) -> bool:
+        return bool(re.match(self.regex, url))
+    
+    def url(self, message_1: types.Message) -> Union[str, None]:
+        messages = [message_1]
+        link = None
+        if message_1.reply_to_message:
+            messages.append(message_1.reply_to_message)
+        for message in messages:
+            text = message.text or message.caption or ""
+            if message.entities:
+                for entity in message.entities:
+                    if entity.type == enums.MessageEntityType.URL:
+                        link = text[entity.offset: entity.offset + entity.length]
+                        break
+            if message.caption_entities:
+                for entity in message.caption_entities:
+                    if entity.type == enums.MessageEntityType.TEXT_LINK:
+                        link = entity.url
+                        break
+        if link:
+            return link.split("&si")[0].split("?si")[0]
+        return None
+    
+    # ================== دوال البحث الأساسية ==================
+
+    async def search(self, query: str, m_id: int) -> Track | None:
+        """بحث عن مقطع باستخدام yt-dlp (يدعم الروابط والنصوص)"""
+        cache_key = query
+        current_time = asyncio.get_running_loop().time()
+        
+        # التحقق من الكاش المحلي
+        if cache_key in self.search_cache:
+            cached_result, cache_timestamp = self.search_cache[cache_key]
+            if current_time - cache_timestamp < 600:
+                fresh = replace(cached_result)
+                fresh.message_id = m_id
+                fresh.file_path = None
+                fresh.user = None
+                fresh.time = 0
+                fresh.video = False
+                print(f"[yt.search] Using cached track: {fresh.title}")
+                return fresh
+        
+        try:
+            import yt_dlp
+            cookie = self.get_cookies()
+            
+            # إذا كان الرابط صحيحاً
+            if self.valid(query):
+                def _extract():
+                    ydl_opts = {
+                        "quiet": True,
+                        "noplaylist": True,
+                        "extract_flat": "in_playlist",
+                        "cookiefile": cookie,
+                        "ignoreerrors": True,
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return ydl.extract_info(query, download=False)
+                
+                data = await asyncio.to_thread(_extract)
+                print(f"[yt.search] Extracted from URL: {data.get('id') if data else None}")
+                if not data:
+                    return None
+                
+                duration_sec = data.get("duration")
+                is_live = data.get("is_live", False)
+                if duration_sec is None and is_live:
+                    duration = "LIVE"
+                    duration_sec = 0
+                else:
+                    duration = utils.format_duration(int(duration_sec)) if duration_sec else "0:00"
+                
+                track = Track(
+                    id=data.get("id"),
+                    channel_name=data.get("uploader") or data.get("channel", ""),
+                    duration=duration,
+                    duration_sec=int(duration_sec) if duration_sec else 0,
+                    message_id=m_id,
+                    title=(data.get("title") or "")[:100],  # زيادة الحد لاستيعاب العناوين الطويلة
+                    thumbnail=data.get("thumbnail") or "",
+                    url=data.get("webpage_url") or query,
+                    view_count=str(data.get("view_count", "")),
+                    is_live=is_live,
+                )
+            else:
+                # بحث باستخدام yt-dlp (ytsearch1:query)
+                print(f"[yt.search] Searching for: {query}")
+                def _search_ytdlp():
+                    ydl_opts = {
+                        "quiet": True,
+                        "extract_flat": True,
+                        "cookiefile": cookie,
+                        "ignoreerrors": True,
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return ydl.extract_info(f"ytsearch1:{query}", download=False)
+                
+                data = await asyncio.to_thread(_search_ytdlp)
+                print(f"[yt.search] ytsearch result: {data is not None}")
+                if not data or 'entries' not in data or not data['entries']:
+                    print("[yt.search] No entries found from ytsearch")
+                    return None
+                
+                entry = data['entries'][0]
+                video_id = entry.get('id')
+                if not video_id:
+                    print("[yt.search] No video id in entry")
+                    return None
+                
+                duration_sec = entry.get('duration')
+                is_live = duration_sec is None  # قد تكون بث مباشر
+                if is_live:
+                    duration = "LIVE"
+                    duration_sec = 0
+                else:
+                    duration = utils.format_duration(int(duration_sec)) if duration_sec else "0:00"
+                
+                track = Track(
+                    id=video_id,
+                    channel_name=entry.get('uploader') or entry.get('channel', ''),
+                    duration=duration,
+                    duration_sec=int(duration_sec) if duration_sec else 0,
+                    message_id=m_id,
+                    title=(entry.get('title', '') or '')[:100],
+                    thumbnail=entry.get('thumbnail', ''),
+                    url=entry.get('webpage_url') or f"{self.base}{video_id}",
+                    view_count=str(entry.get('view_count', '')),
+                    is_live=is_live,
+                )
+                print(f"[yt.search] Found track: {track.title} (ID: {track.id})")
+            
+            # تخزين في الكاش المحلي
+            self.search_cache[cache_key] = (track, current_time)
+            if len(self.search_cache) > 100:
+                oldest_key = min(self.search_cache.keys(), key=lambda k: self.search_cache[k][1])
+                del self.search_cache[oldest_key]
+            
+            return replace(track)
+        except Exception as e:
+            logger.warning(f"YouTube search failed for '{query}': {e}")
+            print(f"[yt.search] Exception: {e}")
+            return None
+
+    async def playlist(self, limit: int, user: str, url: str) -> list[Track]:
+        try:
+            import yt_dlp
+            cookie = self.get_cookies()
+            
+            def _extract_playlist():
+                ydl_opts = {
+                    "quiet": True,
+                    "extract_flat": True,
+                    "cookiefile": cookie,
+                    "ignoreerrors": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            
+            data = await asyncio.to_thread(_extract_playlist)
+            if not data or 'entries' not in data:
+                return []
+            
+            tracks = []
+            for entry in data['entries'][:limit]:
+                if not entry:
+                    continue
+                try:
+                    duration = entry.get('duration', 0)
+                    is_live = duration is None
+                    track = Track(
+                        id=entry.get('id', ''),
+                        channel_name=entry.get('uploader', ''),
+                        duration=utils.format_duration(int(duration)) if duration else "0:00",
+                        duration_sec=int(duration) if duration else 0,
+                        title=(entry.get('title', 'Unknown')[:100]),
+                        thumbnail=entry.get('thumbnail', ''),
+                        url=entry.get('webpage_url', ''),
+                        user=user,
+                        view_count="",
+                        is_live=is_live,
+                    )
+                    tracks.append(track)
+                except Exception:
+                    continue
+            return tracks
+        except Exception as e:
+            logger.warning(f"Playlist extraction failed: {e}")
+            return []
+
+    # ================== دوال التحميل ==================
+
+    async def _download_audio_ytdlp(self, video_id: str, is_live: bool = False) -> Optional[str]:
+        if is_live:
+            print(f"[yt.download] Live stream, getting URL only")
+            return await self._get_live_stream_url(video_id)
+        
+        existing = self._locate_download_file(video_id, video=False)
+        if existing:
+            print(f"[yt.download] Found existing audio file: {existing}")
+            return existing
+        
+        url = self.base + video_id
+        cookie_path = self.get_cookies()
+        print(f"[yt.download] Downloading audio for {video_id}")
+        
+        def download_sync():
+            try:
+                downloads_dir = Path("downloads")
+                downloads_dir.mkdir(parents=True, exist_ok=True)
+                
+                cmd = [
+                    self.ytdlp_path,
+                    "--cookies", cookie_path if cookie_path else "",
+                    "--no-playlist",
+                    "--no-warnings",
+                    "-f", "ba[ext=m4a]/ba/b",
+                    "-N", "8",
+                    "--buffer-size", "1024k",
+                    "-o", f"downloads/%(id)s.%(ext)s",
+                    url
+                ]
+                
+                if not cookie_path:
+                    # إزالة وسيط --cookies والقيمة التالية
+                    if "--cookies" in cmd:
+                        idx = cmd.index("--cookies")
+                        cmd.pop(idx)  # remove --cookies
+                        cmd.pop(idx)  # remove cookie_path
+                
+                print(f"[yt.download] Running: {' '.join(cmd)}")
+                subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+                
+                downloaded = self._locate_download_file(video_id, video=False)
+                print(f"[yt.download] Downloaded audio: {downloaded}")
+                return downloaded
+            except subprocess.TimeoutExpired:
+                logger.error(f"Download timeout for {video_id}")
+                print(f"[yt.download] Timeout")
+                return None
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr.decode() if e.stderr else str(e)
+                logger.warning(f"yt-dlp download failed: {stderr}")
+                print(f"[yt.download] yt-dlp error: {stderr}")
+                # محاولة إرجاع ملف موجود (ربما تم تنزيله جزئياً)
+                return self._locate_download_file(video_id, video=False)
+            except Exception as e:
+                logger.warning(f"Download failed: {e}")
+                print(f"[yt.download] Exception: {e}")
+                return self._locate_download_file(video_id, video=False)
+        
+        async with self._download_semaphore:
+            return await asyncio.to_thread(download_sync)
+
+    async def _get_live_stream_url(self, video_id: str) -> Optional[str]:
+        url = self.base + video_id
+        cookie_path = self.get_cookies()
+        
+        def extract_live_url():
+            try:
+                cmd = [
+                    self.ytdlp_path,
+                    "--cookies", cookie_path if cookie_path else "",
+                    "--no-playlist",
+                    "--no-warnings",
+                    "-f", "ba[ext=m4a]/ba/b",
+                    "-N", "8",
+                    "--buffer-size", "1024k",
+                    "-g",
+                    url
+                ]
+                
+                if not cookie_path:
+                    if "--cookies" in cmd:
+                        idx = cmd.index("--cookies")
+                        cmd.pop(idx)
+                        cmd.pop(idx)
+                
+                print(f"[yt.live] Running: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+                if result.returncode == 0 and result.stdout.strip():
+                    stream_url = result.stdout.strip()
+                    print(f"[yt.live] Live stream URL obtained")
+                    return stream_url
+                print(f"[yt.live] Failed to get live URL: {result.stderr}")
+                return None
+            except Exception as e:
+                logger.error(f"Live stream extraction failed: {e}")
+                print(f"[yt.live] Exception: {e}")
+                return None
+        
+        return await asyncio.to_thread(extract_live_url)
+
+    async def _download_video_ytdlp(self, video_id: str) -> Optional[str]:
+        existing = self._locate_download_file(video_id, video=True)
+        if existing:
+            print(f"[yt.download] Found existing video file: {existing}")
+            return existing
+        
+        url = self.base + video_id
+        cookie_path = self.get_cookies()
+        print(f"[yt.download] Downloading video for {video_id}")
+        
+        def download_video_sync():
+            try:
+                downloads_dir = Path("downloads")
+                downloads_dir.mkdir(parents=True, exist_ok=True)
+                
+                height_filter = f"[height<={self._max_video_height}]" if self._max_video_height else ""
+                format_str = f"bestvideo[ext=mp4]{height_filter}+bestaudio[ext=m4a]/bestvideo{height_filter}+bestaudio/best"
+                
+                cmd = [
+                    self.ytdlp_path,
+                    "--cookies", cookie_path if cookie_path else "",
+                    "--no-playlist",
+                    "--no-warnings",
+                    "-f", format_str,
+                    "-N", "8",
+                    "--buffer-size", "1024k",
+                    "-o", f"downloads/%(id)s.%(ext)s",
+                    "--merge-output-format", "mp4",
+                    "--no-progress",
+                    url
+                ]
+                
+                if not cookie_path:
+                    if "--cookies" in cmd:
+                        idx = cmd.index("--cookies")
+                        cmd.pop(idx)
+                        cmd.pop(idx)
+                
+                print(f"[yt.download] Running: {' '.join(cmd)}")
+                subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+                
+                downloaded = self._locate_download_file(video_id, video=True)
+                print(f"[yt.download] Downloaded video: {downloaded}")
+                return downloaded
+            except subprocess.TimeoutExpired:
+                logger.error(f"Video download timeout for {video_id}")
+                print(f"[yt.download] Timeout")
+                return self._locate_download_file(video_id, video=True)
+            except Exception as e:
+                logger.warning(f"Video download failed: {e}")
+                print(f"[yt.download] Exception: {e}")
+                return self._locate_download_file(video_id, video=True)
+        
+        async with self._download_semaphore:
+            return await asyncio.to_thread(download_video_sync)
+
+    async def download(self, video_id: str, is_live: bool = False, video: bool = False) -> Optional[str]:
+        if video:
+            return await self._download_video_ytdlp(video_id)
+        return await self._download_audio_ytdlp(video_id, is_live)
+
+    # ================== دوال L2 (الكاش العام - المشترك) ==================
+
+    async def get_cached_track(self, video_id: str) -> dict | None:
+        try:
+            if not video_id:
+                return None
+            data = await r.music_get(video_id)
+            if data and data.get("msg_id"):
+                return {"msg_id": data.get("msg_id")}
+            return None
+        except Exception as e:
+            logger.error(f"Error in get_cached_track for {video_id}: {e}")
+            return None
+
+    async def save_track_to_cache(self, video_id: str, msg_id: int) -> bool:
+        try:
+            if not video_id or not msg_id:
+                return False
+            return await r.music_set(video_id, msg_id)
+        except Exception as e:
+            logger.error(f"Error in save_track_to_cache for {video_id}: {e}")
+            return False
+
+    async def track_exists_in_cache(self, video_id: str) -> bool:
+        try:
+            if not video_id:
+                return False
+            return await r.music_exists(video_id)
+        except Exception as e:
+            logger.error(f"Error in track_exists_in_cache for {video_id}: {e}")
+            return False
+
+    async def mark_track_as_broken(self, video_id: str) -> bool:
+        try:
+            if not video_id:
+                return False
+            return await r.music_delete(video_id)
+        except Exception as e:
+            logger.error(f"Error in mark_track_as_broken for {video_id}: {e}")
+            return False
+
+    async def get_all_cached_tracks(self) -> list:
+        try:
+            return await r.music_get_all()
+        except Exception as e:
+            logger.error(f"Error in get_all_cached_tracks: {e}")
+            return []
+
+    async def get_cached_tracks_count(self) -> int:
+        try:
+            return await r.music_count()
+        except Exception as e:
+            logger.error(f"Error in get_cached_tracks_count: {e}")
+            return 0
