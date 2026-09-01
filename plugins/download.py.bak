@@ -1,0 +1,365 @@
+from helpers.context import get_global_r, get_global_dev, get_global_k
+r = get_global_r()
+Dev_FINAL = get_global_dev()
+k = get_global_k()
+import yt_dlp, os, requests, re, time, wget, random, json, logging
+from yt_dlp import YoutubeDL
+from compat import Client, filters, types
+from compat import ChatType
+from shazamio import Shazam
+from compat import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle, InputTextMessageContent, InputMediaAudio
+from helpers.ranks import *
+from PIL import Image, ImageFilter
+import glob
+import asyncio
+import sqlite3
+import traceback
+from helpers.replies_store import (
+    REPLIES,
+    plugins_download_105,
+    plugins_download_127,
+    plugins_download_219,
+    plugins_download_86,
+)
+import html
+ytdb = r
+sounddb = r
+shazam = Shazam()
+
+cookies_files = glob.glob("FinalMusic/cookies/*.txt")
+cookies_file = random.choice(cookies_files) if cookies_files else None
+
+def time_to_seconds(time):
+    stringt = str(time)
+    return sum(
+        int(x) * 60 ** i for i, x in enumerate(reversed(stringt.split(":")))
+    )
+
+def Find(text):
+    if not text:
+        return []
+    m = r"(?i)\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s!()\[\]{};:'\".,<>?«»“”‘’]))"
+    url = re.findall(m, text)
+    res = [x[0] for x in url]
+    res = [u for u in res if "soundcloud" not in u.lower() and "on.soundcloud" not in u.lower()]
+    res = [u for u in res if not u.startswith("W/")]
+    return res
+
+@Client.on_message(filters.text & filters.group, group=32)
+async def ytdownloaderHandler(c, m):
+    if not m.text:
+        return
+    
+    r = get_global_r()
+    Dev_FINAL = get_global_dev()
+    k = get_global_k()
+    k = await r.get(f'{Dev_FINAL}:botkey') or ""
+    channel = await r.get(f'{Dev_FINAL}:BotChannel') or ''
+    archive_channel_id = await r.get(f'{Dev_FINAL}:ArchiveChannel') or channel
+    asyncio.create_task(yt_func_timed(c, m, k, channel, archive_channel_id))
+
+async def yt_func_timed(c, m, k, channel, archive_channel_id):
+    try:
+        result = await yt_func(c, m, k, channel, archive_channel_id)
+        if result and isinstance(result, dict) and 'message' in result:
+            message = result['message']
+            try:
+                duration_string = message.caption.split('~')[1] if '~' in message.caption else ""
+                await c.edit_message_caption(
+                    chat_id=m.chat.id, 
+                    message_id=message.id, 
+                    caption=f"@{channel} ~ {duration_string}".replace("⏳", "✅")
+                )
+            except:
+                pass
+    except Exception as e:
+        print(f"Error in yt_func_timed: {e}")
+
+async def yt_func(c, m, k, channel, archive_channel_id):
+    r = get_global_r()
+    Dev_FINAL = get_global_dev()
+    k = get_global_k()
+    
+    if not m.text:
+        return
+    
+    text = m.text
+    
+    if not await check_global_restrictions(c, m, k):
+        return
+
+    if text.startswith('ساوند '):
+        return await m.reply(plugins_download_86(k))
+        query = text.split(None,1)[1]
+        data = requests.get(f"https://m.soundcloud.com/search?q={query}")
+        urls = re.findall(r'data-testid="cell-entity-link" href="([^"]+)', data.text)
+        names = re.findall(r'<div class="Information_CellTitle__2KitR">([^<]+)', data.text)
+        result = []
+        for i in range(len(urls)): result.append({'name': names[i], 'url': f'{urls[i]}'})
+        buttons = []
+        btns = InlineKeyboardMarkup(buttons)
+        count = 0
+        for a in result:
+            if count == 5:
+                break
+            url = a['url']
+            buttons.append([
+            InlineKeyboardButton (a['name'], switch_inline_query_current_chat=f'{url}#SOUND')
+            ]
+            )
+            count += 1
+        await m.reply(plugins_download_105(k, query), reply_markup=btns)
+        return True
+
+    if text.startswith("W/") or "soundcloud.comW/" in text or text.startswith("on.soundcloud.comW/"):
+        return
+
+    if text.startswith('تيك '):
+        if await r.get(f'{m.chat.id}:disableTik:{Dev_FINAL}'):  return
+        if await r.get(f':disableYT:{Dev_FINAL}'):  return
+        urls = Find(text)
+        if not urls:
+            return await m.reply(REPLIES['plugins_download_116'])
+        
+        url = urls[0]
+        wait_msg = await m.reply(REPLIES['plugins_download_119'])
+        
+        try:
+            response = await http_get_json(f"https://www.tikwm.com/api/?url={url}")
+            
+            if response.get('code') != 0:
+                await wait_msg.delete()
+                error_msg = response.get('msg', 'رابط غير صالح')
+                return await m.reply(plugins_download_127(error_msg))
+            
+            if 'data' not in response or 'play' not in response['data']:
+                await wait_msg.delete()
+                return await m.reply(REPLIES['plugins_download_131'])
+            
+            video_url = response["data"]["play"]
+            title = response["data"].get("title", "فيديو تيك توك")
+            duration = response["data"].get("duration", 0)
+            views = response["data"].get("play_count", 0)
+            likes = response["data"].get("digg_count", 0)
+            comments = response["data"].get("comment_count", 0)
+            shares = response["data"].get("share_count", 0)
+            author = response["data"].get("author", {}).get("unique_id", "مستخدم")
+            
+            if duration > 0:
+                minutes = duration // 60
+                seconds = duration % 60
+                duration_str = f"{minutes:02d}:{seconds:02d}"
+            else:
+                duration_str = "00:00"
+            
+            caption_parts = [
+                f"`{title}`",
+                f"{k} طول المقطع : {duration_str}",
+                f"{k} المشاهدات : {views:,}",
+                f"{k} اللايكات : {likes:,}",
+                f"{k} الكومنت : {comments:,}",
+                f"{k} المشاركات : {shares:,}",
+                f"\n~ @{channel}"
+            ]
+            
+            reply_markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"@{author}", url=f"https://www.tiktok.com/@{author}")]
+            ])
+            
+            await wait_msg.delete()
+            
+            await m.reply_video(
+                video_url,
+                caption="\n".join(caption_parts),
+                reply_markup=reply_markup
+            )
+            
+        except requests.exceptions.RequestException as e:
+            await wait_msg.delete()
+            error_text = f"خطأ في الاتصال: {str(e)}"
+            print(f"[تيك توك] خطأ اتصال: {e}")
+            traceback.print_exc()
+            return await m.reply(error_text)
+            
+        except KeyError as e:
+            await wait_msg.delete()
+            error_text = f"خطأ في البيانات: {str(e)}"
+            print(f"[تيك توك] خطأ مفتاح: {e}")
+            print(f"[تيك توك] الرد: {response}")
+            traceback.print_exc()
+            return await m.reply(error_text)
+            
+        except json.JSONDecodeError as e:
+            await wait_msg.delete()
+            error_text = f"خطأ في تنسيق الرد: {str(e)}"
+            print(f"[تيك توك] خطأ JSON: {e}")
+            traceback.print_exc()
+            return await m.reply(error_text)
+            
+        except Exception as e:
+            await wait_msg.delete()
+            error_text = f"خطأ غير متوقع: {str(e)}"
+            print(f"[تيك توك] خطأ غير متوقع: {e}")
+            traceback.print_exc()
+            return await m.reply(error_text)
+        return True
+
+    if text.endswith(' #AUDIO'):
+        find = Find(text)
+        if find:
+            url = find[0]
+            if 'soundcloud' in url:
+                return True
+
+    if text.endswith(' #VOICE'):
+        find = Find(text)
+        if find:
+            url = find[0]
+            if 'soundcloud' in url:
+                return True
+
+    find = Find(text)
+    if find:
+        url = find[0]
+        if 'soundcloud' in url:
+            return await m.reply(plugins_download_219(k))
+
+@Client.on_message(filters.regex("^شازام$") & filters.group)
+async def shazamFunc(c,m):
+   r = get_global_r()
+   Dev_FINAL = get_global_dev()
+   k = get_global_k()
+   if not await check_global_restrictions(c, m, k):
+       return
+   if await r.get(f'{m.chat.id}:disableShazam:{Dev_FINAL}'):  return False
+   if m.reply_to_message and (m.reply_to_message.audio or m.reply_to_message.voice or m.reply_to_message.video):
+     if m.reply_to_message.audio:
+       duration=m.reply_to_message.audio.duration if m.reply_to_message.audio.duration else 301
+       fileSize=m.reply_to_message.audio.file_size
+     if m.reply_to_message.voice:
+       duration=m.reply_to_message.voice.duration if m.reply_to_message.voice.duration else 301
+       fileSize=m.reply_to_message.voice.file_size
+     if m.reply_to_message.video:
+       duration=m.reply_to_message.video.duration if m.reply_to_message.video.duration else 301
+       fileSize=m.reply_to_message.video.file_size
+     if duration > 300:
+       return await m.reply(REPLIES['plugins_download_238'])
+     if fileSize > 26214400:
+       return await m.reply(REPLIES['plugins_download_240'])
+     id = random.randint(1,1000)
+     msg = await m.reply(REPLIES['plugins_download_242'])
+     audio = await m.reply_to_message.download(f'./shazam{id}.ogg')
+     out = await shazam.recognize_song(f'shazam{id}.ogg')
+     os.remove(f'shazam{id}.ogg')
+     await msg.delete()
+     if not out["matches"]:
+       return await m.reply(REPLIES['plugins_download_248'])
+     else:
+       title = out["track"]["title"]
+       author = out["track"]["subtitle"]
+       try:
+         photo = out["track"]["images"]["background"]
+       except:
+         photo = "https://telegra.ph/file/49ace69e7c43c0041fb63.jpg"
+       k = await r.get(f'{Dev_FINAL}:botkey')
+       channel = await r.get(f'{Dev_FINAL}:BotChannel') if await r.get(f'{Dev_FINAL}:BotChannel') else ''
+       url = out["track"]["url"]
+       # تعديل النص ليظهر بصيغة HTML بدلاً من Markdown
+       TEXT = f"""
+<b>{k} اسم الصوت</b>: <a href="{url}">{title}</a>
+<b>{k} اسم الفنان</b>: <b>{author}</b>
+"""
+       key = InlineKeyboardMarkup ([[InlineKeyboardButton ("🧚‍♀️",url=f"t.me/{channel}")]])
+       # إضافة parse_mode='HTML' لعرض النص بصيغة HTML
+       await m.reply_photo(
+         photo,caption=TEXT,reply_markup=key, parse_mode='HTML')
+
+@Client.on_message(filters.regex("^شازام ") & filters.group)
+async def shazamLyrics(c,m):
+   r = get_global_r()
+   Dev_FINAL = get_global_dev()
+   k = get_global_k()
+   if not await check_global_restrictions(c, m, k):
+       return
+   if await r.get(f'{m.chat.id}:disableShazam:{Dev_FINAL}'):  return False
+   if not m.text:
+       return
+   query = m.text.split(None,1)[1]
+   out = await shazam.search_track(query=query, limit=1)
+   if not out:
+     return await m.reply(REPLIES['plugins_download_278'])
+   else:
+    try:
+     key = int(out["tracks"]["hits"][0]["key"])
+     title = out["tracks"]["hits"][0]["heading"]["title"][:35]
+     author = out["tracks"]["hits"][0]["heading"]["subtitle"]
+     url = out["tracks"]["hits"][0]["url"]
+     track_id = key
+     about_track = await shazam.track_about(track_id=track_id)
+     text=about_track["sections"][1]["text"]
+     lyrics=""
+     for tt in text:
+       lyrics+=tt+"\n"
+     return await m.reply(lyrics[:4096],reply_markup=InlineKeyboardMarkup (
+       [[InlineKeyboardButton (f"{title} - {author}",url=url)]]
+     )
+     )
+    except:
+     return await m.reply(REPLIES['plugins_download_278'])
+
+@Client.on_inline_query(filters.regex("SOUND"))
+async def SoundCloud(c, query):
+  return await query.answer(results=[], cache_time=1)
+  r = get_global_r()
+  Dev_FINAL = get_global_dev()
+  k = get_global_k()
+  url = query.query.split("#SOUND")[0]
+  channel = await r.get(f'{Dev_FINAL}:BotChannel') if await r.get(f'{Dev_FINAL}:BotChannel') else ''
+  if url.count('/') > 1:
+    await query.answer(
+        results=[
+            InlineQueryResultArticle(
+                id="sound_audio_1",
+                title="اضغط هنا للتحميل - صوت",
+                thumb_url='https://t.me/D7BotResources/161',
+                description='~ @i0i0ii ',
+                url='https://t.me/i0i0ii',
+                reply_markup=InlineKeyboardMarkup ([[InlineKeyboardButton ("🧝‍♀️", url=f't.me/{channel}')]]),
+                input_message_content=InputTextMessageContent(f'https://soundcloud.com{url} #AUDIO',disable_web_page_preview=True)
+            ),
+            InlineQueryResultArticle(
+                id="sound_voice_1",
+                title="اضغط هنا للتحميل - بصمة",
+                thumb_url='https://t.me/D7BotResources/163',
+                description='~ @i0i0ii ',
+                url='https://t.me/i0i0ii',
+                reply_markup=InlineKeyboardMarkup ([[InlineKeyboardButton ("🧝‍♀️", url=f't.me/{channel}')]]),
+                input_message_content=InputTextMessageContent(f'https://soundcloud.com{url} #VOICE',disable_web_page_preview=True)
+            ),
+        ],
+        cache_time=1
+        )
+  else:
+    await query.answer(
+        results=[
+            InlineQueryResultArticle(
+                id="sound_audio_2",
+                title="اضغط هنا للتحميل - صوت",
+                thumb_url='https://t.me/D7BotResources/161',
+                description='~ @i0i0ii ',
+                url='https://t.me/i0i0ii',
+                reply_markup=InlineKeyboardMarkup ([[InlineKeyboardButton ("🧝‍♀️", url=f't.me/{channel}')]]),
+                input_message_content=InputTextMessageContent(f'https://on.soundcloud.com{url} #AUDIO',disable_web_page_preview=True)
+            ),
+            InlineQueryResultArticle(
+                id="sound_voice_2",
+                title="اضغط هنا للتحميل - بصمة",
+                thumb_url='https://t.me/D7BotResources/163',
+                description='~ @i0i0ii ',
+                url='https://t.me/i0i0ii',
+                reply_markup=InlineKeyboardMarkup ([[InlineKeyboardButton ("🧝‍♀️", url=f't.me/{channel}')]]),
+                input_message_content=InputTextMessageContent(f'https://on.soundcloud.com{url} #VOICE',disable_web_page_preview=True)
+            ),
+        ],
+        cache_time=1
+        )
